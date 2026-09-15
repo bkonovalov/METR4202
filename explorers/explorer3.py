@@ -335,7 +335,7 @@ class FrontierExplorer(Node):
             BehaviorTreeLog, g('bt_log_topic').value, self.bt_log_callback, 10)
         self.create_subscription(
             PoseWithCovarianceStamped, g('pose_topic').value,
-            self.pose_callback, latched)
+            self.pose_callback, 10)
 
         self.goal_pub = self.create_publisher(
             PoseStamped, g('goal_topic').value, 10)
