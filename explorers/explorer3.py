@@ -284,6 +284,8 @@ class FrontierExplorer(Node):
         self.declare_parameter('edge_radius', 1.5)
         self.declare_parameter('graph_path', '/tmp/exploration_graph')
         self.declare_parameter('random_seed', -1)
+        self.declare_parameter('kickstart_timeout', 5.0)   # sec to wait before self-nudging
+        self.declare_parameter('kickstart_distance', 1.0)  # metres, straight ahead in map frame
 
         g = self.get_parameter
         self.map_frame = g('map_frame').value
@@ -299,6 +301,8 @@ class FrontierExplorer(Node):
         self.goal_timeout = float(g('goal_timeout').value)
         self.settle_time = float(g('settle_time').value)
         self.graph_path = str(g('graph_path').value)
+        self.kickstart_timeout = float(g('kickstart_timeout').value)
+        self.kickstart_distance = float(g('kickstart_distance').value)
 
         seed = int(g('random_seed').value)
         self.rng = random.Random(None if seed < 0 else seed)
@@ -315,6 +319,8 @@ class FrontierExplorer(Node):
         self.goals_reached = 0
         self.finished = False
         self._settle_timer = None
+        self.start_time = self.get_clock().now()
+        self.kickstarted = False
 
         self.graph = WaypointGraph(
             merge_radius=float(g('node_merge_radius').value),
@@ -385,8 +391,16 @@ class FrontierExplorer(Node):
             return
 
         if self.map_msg is None or self.robot_xy is None:
-            self.get_logger().info(
-                'Waiting for map and pose...', throttle_duration_sec=5.0)
+            elapsed = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
+            if not self.kickstarted and elapsed > self.kickstart_timeout:
+                self.get_logger().warn(
+                    f'No map/pose after {elapsed:.1f}s - sending a one-off '
+                    f'nudge goal so slam_toolbox has something to react to.')
+                self.send_kickstart_goal()
+                self.kickstarted = True
+            else:
+                self.get_logger().info(
+                    'Waiting for map and pose...', throttle_duration_sec=5.0)
             return
 
         if self.goals_sent == 0:
@@ -394,6 +408,22 @@ class FrontierExplorer(Node):
             nid, _ = self.graph.add_or_get_node(*self.robot_xy)
             self.last_node_id = nid
             self.explore_step()
+
+    def send_kickstart_goal(self):
+        """
+        Fired once if the robot never receives a /pose message on its own.
+        slam_toolbox only publishes pose after it processes a scan tied to
+        motion, so this breaks the deadlock by sending one small forward
+        goal in the map frame - the map origin coincides with the robot's
+        start pose, so this is a safe nudge regardless of spawn location.
+        """
+        goal = PoseStamped()
+        goal.header.frame_id = self.map_frame
+        goal.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.position.x = self.kickstart_distance
+        goal.pose.position.y = 0.0
+        goal.pose.orientation.w = 1.0
+        self.goal_pub.publish(goal)
 
     def on_goal_finished(self):
         """Record the outcome, update the graph, then choose the next goal."""
@@ -447,9 +477,9 @@ class FrontierExplorer(Node):
             return
 
         candidates = self.find_frontier_goals()
-        self.publish_frontier_markers(candidates)
 
         if not candidates:
+            self.publish_frontier_markers(candidates)
             self.get_logger().info(
                 f'No reachable frontiers left. Exploration complete after '
                 f'{self.goals_sent} goals ({self.goals_reached} reached).')
@@ -458,6 +488,7 @@ class FrontierExplorer(Node):
             return
 
         goal = self.pick_goal(candidates)
+        self.publish_frontier_markers(candidates, chosen=goal)
         self.send_goal(*goal)
 
     def find_frontier_goals(self):
@@ -573,11 +604,14 @@ class FrontierExplorer(Node):
 
         self.graph_pub.publish(arr)
 
-    def publish_frontier_markers(self, candidates):
+    def publish_frontier_markers(self, candidates, chosen=None):
         arr = MarkerArray()
+        stamp = self.get_clock().now().to_msg()
+
+        # All candidate frontiers - magenta cubes
         m = Marker()
         m.header.frame_id = self.map_frame
-        m.header.stamp = self.get_clock().now().to_msg()
+        m.header.stamp = stamp
         m.ns = 'frontiers'
         m.id = 0
         m.type = Marker.CUBE_LIST
@@ -588,6 +622,29 @@ class FrontierExplorer(Node):
         for x, y, _size, _dist in candidates:
             m.points.append(Point(x=float(x), y=float(y), z=0.05))
         arr.markers.append(m)
+
+        # The one actually chosen this round - bright green sphere,
+        # rendered bigger so it stands out from the candidate cloud.
+        goal_marker = Marker()
+        goal_marker.header.frame_id = self.map_frame
+        goal_marker.header.stamp = stamp
+        goal_marker.ns = 'selected_goal'
+        goal_marker.id = 1
+        if chosen is not None:
+            goal_marker.type = Marker.SPHERE
+            goal_marker.action = Marker.ADD
+            goal_marker.scale.x = goal_marker.scale.y = goal_marker.scale.z = 0.35
+            goal_marker.pose.position.x = float(chosen[0])
+            goal_marker.pose.position.y = float(chosen[1])
+            goal_marker.pose.position.z = 0.15
+            goal_marker.pose.orientation.w = 1.0
+            goal_marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
+        else:
+            # No goal this round (e.g. exploration finished) - clear
+            # any previously drawn selected-goal marker from RViz.
+            goal_marker.action = Marker.DELETE
+        arr.markers.append(goal_marker)
+
         self.frontier_pub.publish(arr)
 
     # --------------------------------------------------------------- save
