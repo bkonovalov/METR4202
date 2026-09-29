@@ -44,6 +44,7 @@ class FrontierDetector(Node):
         # Iterate through adjacent cells (up, down, left, right)
         # max and min functions are to limit row and col to within the bounds
         # of the map
+        total_adjacent = 0
         for r in range(max(0, row - 1), min(height, row + 2)):
             for c in range(max(0, col - 1), min(width, col + 2)):
                 # skip over position of known free cell
@@ -54,14 +55,13 @@ class FrontierDetector(Node):
                 index = r * width + c
                 if data[index] == -1:
                     # frontier cell found
-                    return True
-        return False
+                    total_adjacent += 1
+        
+        return total_adjacent
 
     def map_callback(self, msg):
         self.get_logger().info("recieved message")
         goals = []
-        poses = []
-
 
         # define map parameters
         width = msg.info.width
@@ -76,18 +76,18 @@ class FrontierDetector(Node):
                 if cell_value != 0:
                     continue
             
-                if not self.adjacent_to_unknown(msg.data, row, col, width, height):
+                count = self.adjacent_to_unknown(msg.data, row, col, width, height)
+                if count == 0:
                     continue
 
                 x = msg.info.origin.position.x + (col + 0.5) * msg.info.resolution
                 y = msg.info.origin.position.y + (row + 0.5) * msg.info.resolution
+                pose = self.create_pose(x,y)
 
-                goals.append((x, y))
+                goals.append((pose, count))
 
-        for x, y in goals:
-            poses.append(self.create_pose(x, y))
-
-        self.publisher.publish(PoseArray(header=msg.header, poses=poses))
+        goals.sort(key=lambda x: x[1], reverse=True)
+        self.publisher.publish(PoseArray(header=msg.header, poses=[goal[0] for goal in goals]))
 
 def main(args=None):
     rclpy.init(args=args)
@@ -95,3 +95,6 @@ def main(args=None):
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
