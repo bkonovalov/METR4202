@@ -1,9 +1,11 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 from geometry_msgs.msg import PoseArray, Pose, PoseStamped
 from nav2_msgs.msg import BehaviorTreeLog
 from tf2_ros import Buffer, TransformListener, TransformException
+from nav_msgs.msg import OccupancyGrid
 
 class WaypointCommander(Node):
     def __init__(self):
@@ -13,7 +15,7 @@ class WaypointCommander(Node):
         self.have_goal = False
         self.current_goal = None
         self.goal_start_time = None
-        self.goal_timeout = 15.0
+        self.goal_timeout = 50.0
         self.tolerance = 0.5
         self.blacklist = []
         self.blacklist_radius = 0.5
@@ -21,6 +23,14 @@ class WaypointCommander(Node):
         self.current_goal = None
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        self.last_position = None
+        self.last_position_time = None
+        self.stall_check_interval = 3.0
+        self.stall_distance_threshold = 0.1
+
+        self.latest_costmap = None
+        self.lethal_cost_threshold = 99
 
         self.sub_frontier = self.create_subscription(
             PoseArray,
@@ -42,10 +52,25 @@ class WaypointCommander(Node):
             10
         )
 
+        costmap_qos = rclpy.qos.QoSProfile(
+            reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
+            durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
+            depth=1)
+        
+        self.costmap_sub = self.create_subscription(
+            OccupancyGrid,
+            "global_costmap/costmap",
+            self.costmap_callback,
+            costmap_qos
+        )
+
         self.create_timer(0.5, self.check_progress)
     
     def candidates_callback(self, msg):
         self.latest_candidates = msg.poses
+
+    def costmap_callback(self, msg):
+        self.latest_costmap = msg
 
     def get_robot_position(self):
         try:
@@ -56,6 +81,10 @@ class WaypointCommander(Node):
             return None
 
     def bt_log_callback(self, msg):
+        if not self.have_goal:
+            return
+
+        self.check_stall_timeout()
         if not self.have_goal:
             return
 
@@ -72,10 +101,10 @@ class WaypointCommander(Node):
             self.current_goal = None
             return
         
-        err = self.distance(pos, self.current_goal)
+        #err = self.distance(pos, self.current_goal)
 
-        if err > self.tolerance:
-            self.blacklist.append(self.current_goal)
+        #if err > self.tolerance:
+        self.blacklist.append(self.current_goal)
         
         self.have_goal = False
         self.current_goal = None
@@ -92,22 +121,60 @@ class WaypointCommander(Node):
         waypoint.pose.orientation.w = 1.0
         return waypoint
 
+    def is_reachable(self, x, y):
+        if self.latest_costmap is None:
+            return True
+        
+        info = self.latest_costmap.info
+        col = int((x - info.origin.position.x) / info.resolution)
+        row = int((y - info.origin.position.y) / info.resolution)
+
+        if col < 0 or col >= info.width or row < 0 or row >= info.height:
+            return False
+        
+        index = row * info.width + col
+        cost = self.latest_costmap.data[index]
+
+        return cost < self.lethal_cost_threshold
+
+    def check_stall_timeout(self):
+        elapsed_time = (self.get_clock().now() - self.goal_start_time).nanoseconds / 1e9
+        if elapsed_time > self.goal_timeout:
+            self.blacklist.append(self.current_goal)
+            self.get_logger().warn("Goal timeout reached. Cancelling goal.")
+            self.have_goal = False
+            return
+
+        since_last_check = (self.get_clock().now() - self.last_position_time).nanoseconds / 1e9
+        if since_last_check > self.stall_check_interval:
+            curr_pos = self.get_robot_position()
+            old_pos = self.last_position
+
+            self.last_position = curr_pos
+            self.last_position_time = self.get_clock().now()
+
+            if curr_pos is not None and old_pos is not None:
+                dist_moved = self.distance(curr_pos, old_pos)
+                if dist_moved < self.stall_distance_threshold:
+                    self.blacklist.append(self.current_goal)
+                    self.get_logger().warn("Robot appears to be stalled. Cancelling goal.")
+                    self.have_goal = False
+
+                    return
+
     def check_progress(self):
         # check if robot has a goal to move towards
         if self.have_goal:
-            elapsed_time = (self.get_clock().now() - self.goal_start_time).nanoseconds / 1e9
-            if elapsed_time > self.goal_timeout:
-                self.blacklist.append(self.current_goal)
-                self.get_logger().warn("Goal timeout reached. Cancelling goal.")
-                self.have_goal = False
-            return
-        
-        for pose in self.latest_candidates:
-            x, y = pose.position.x, pose.position.y
-            if any(self.distance((x,y), point) < self.blacklist_radius for point in self.blacklist):
-                continue
-            self.send_goal(x, y)
-            return
+            self.check_stall_timeout()
+        else:
+            for pose in self.latest_candidates:
+                x, y = pose.position.x, pose.position.y
+                if any(self.distance((x,y), point) < self.blacklist_radius for point in self.blacklist):
+                    continue
+                if not self.is_reachable(x, y):
+                    continue
+                self.send_goal(x, y)
+                return
     
     def send_goal(self, x, y):
         pose = self.create_pose(x,y)
@@ -115,6 +182,10 @@ class WaypointCommander(Node):
         self.current_goal = (x, y)
         self.have_goal = True
         self.goal_start_time = self.get_clock().now()
+
+        # record the robot's current position and time pose was sent
+        self.last_position = self.get_robot_position()
+        self.last_position_time = self.get_clock().now()
 
 def main():
     rclpy.init()
